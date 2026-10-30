@@ -1,0 +1,149 @@
+name: payment-service
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: payments
+      POSTGRES_PASSWORD: payments
+      POSTGRES_DB: payments
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-55432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U payments -d payments"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+  rabbitmq:
+    image: rabbitmq:4.1-management-alpine
+    hostname: rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: payments
+      RABBITMQ_DEFAULT_PASS: payments
+    ports:
+      - "127.0.0.1:${RABBITMQ_PORT:-5673}:5672"
+      - "127.0.0.1:${RABBITMQ_MANAGEMENT_PORT:-15673}:15672"
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  migrate:
+    build: .
+    environment:
+      DATABASE_URL: postgresql+asyncpg://payments:payments@postgres:5432/payments
+    command: ["alembic", "upgrade", "head"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api:
+    build: .
+    environment:
+      DATABASE_URL: postgresql+asyncpg://payments:payments@postgres:5432/payments
+      API_KEY: ${API_KEY:?Copy .env.example to .env and set API_KEY}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    command: ["uvicorn", "payment_service.api.app:app", "--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      - "127.0.0.1:${API_PORT:-8000}:8000"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import os, urllib.request;
+          r = urllib.request.Request('http://localhost:8000/health',
+          headers={'X-API-Key': os.environ['API_KEY']});
+          urllib.request.urlopen(r, timeout=3).close()
+      interval: 5s
+      timeout: 4s
+      retries: 10
+
+  consumer:
+    build: .
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql+asyncpg://payments:payments@postgres:5432/payments
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      RABBITMQ_URL: amqp://payments:payments@rabbitmq:5672/
+      PROCESSING_RETRY_BASE_DELAY: ${PROCESSING_RETRY_BASE_DELAY:-2}
+      PROCESSING_RETRY_MAX_DELAY: ${PROCESSING_RETRY_MAX_DELAY:-30}
+      GATEWAY_ERROR_MODE: ${GATEWAY_ERROR_MODE:-none}
+      WEBHOOK_TIMEOUT: ${WEBHOOK_TIMEOUT:-5}
+      WEBHOOK_SIGNING_SECRET: ${WEBHOOK_SIGNING_SECRET:?Set WEBHOOK_SIGNING_SECRET in .env}
+    command: ["python", "-m", "payment_service.messaging.consumer"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      rabbitmq:
+        condition: service_healthy
+    stop_grace_period: 40s
+
+  outbox:
+    build: .
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql+asyncpg://payments:payments@postgres:5432/payments
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      RABBITMQ_URL: amqp://payments:payments@rabbitmq:5672/
+      OUTBOX_RETENTION_DAYS: ${OUTBOX_RETENTION_DAYS:-7}
+      OUTBOX_POLL_INTERVAL: ${OUTBOX_POLL_INTERVAL:-0.5}
+      OUTBOX_PUBLISH_TIMEOUT: ${OUTBOX_PUBLISH_TIMEOUT:-5}
+      OUTBOX_RETRY_BASE_DELAY: ${OUTBOX_RETRY_BASE_DELAY:-1}
+      OUTBOX_RETRY_MAX_DELAY: ${OUTBOX_RETRY_MAX_DELAY:-60}
+    command: ["python", "-m", "payment_service.messaging.outbox"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      rabbitmq:
+        condition: service_healthy
+    stop_grace_period: 70s
+
+  webhook-demo:
+    profiles: ["demo"]
+    image: python:3.11-slim
+    environment:
+      WEBHOOK_SIGNING_SECRET: ${WEBHOOK_SIGNING_SECRET:?Set WEBHOOK_SIGNING_SECRET in .env}
+    command: ["python", "-u", "/receiver.py"]
+    volumes:
+      - ./demo/webhook_receiver.py:/receiver.py:ro
+    ports:
+      - "127.0.0.1:${WEBHOOK_DEMO_PORT:-8081}:8080"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - import urllib.request; urllib.request.urlopen('http://localhost:8080/health', timeout=2).close()
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  tests:
+    profiles: ["test"]
+    build:
+      context: .
+      target: test
+    environment:
+      TEST_DATABASE_URL: postgresql+asyncpg://payments:payments@postgres:5432/payments
+      TEST_RABBITMQ_URL: amqp://payments:payments@rabbitmq:5672/
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+
+
+volumes:
+  postgres-data:
+  rabbitmq-data:
